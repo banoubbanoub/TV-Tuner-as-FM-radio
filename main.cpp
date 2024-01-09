@@ -1,359 +1,178 @@
-#include <Arduino.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <IRremote.h>
-int RECV_PIN = 5;  // IR Receiver pin
-IRrecv irrecv(RECV_PIN);
-decode_results results;
-LiquidCrystal_I2C  lcd(0x27, 16, 2);
-#define clk 4
-#define dta 3
-#define sw 5
-#define s0 8
-#define s1 9
-#define en 11
-#define cnt1 6
-#define cnt2 7
-int cureentclock =0;
-int previceClock =0;
-int TVIF = 57;
-int FMradioIF = 107;
-int FM915IF = 26;
-int CBIF = 27;
-uint16_t CBFraquency = 1500;
-uint16_t FM915Frequency = 17465;
-uint16_t TVFrequency = 2100;
-uint16_t FMFrequency = 2400;
-uint16_t FrequencyVariable=0;
-int tvSelect=0;
-int chSelect =0;
+#include <Encoder.h>
 
-void videoSwitchOutput(int p){
-switch (p)
-{
-case 6:
-digitalWrite(s0,HIGH);
-digitalWrite(s1,LOW);
-digitalWrite(en,LOW);
-  break;
-  case 7:
-digitalWrite(s0,LOW);
-digitalWrite(s1,LOW);
-digitalWrite(en,LOW);
-  break;
-case 8:
-digitalWrite(s0,HIGH);
-digitalWrite(s1,HIGH);
-digitalWrite(en,LOW);
-  break;
-}
+// I2C device address
+#define DEVICE_ADDRESS 0x10
 
-}
-// Select I2C BUS
-void TCA9548A(uint8_t bus){
-  Wire.beginTransmission(0x70);  // TCA9548A address
-  Wire.write(1 << bus);          // send byte to select bus
-  Wire.endTransmission();
-}
+// Reference Divider
+#define REFERENCE_DIVIDER 640
+// Step Size
+#define STEP_SIZE 50000 // 50 kHz
 
-void videoProcessors(){
-  TCA9548A(3);
-  Wire.beginTransmission(0B01001101);//b01001101
- 
-  Wire.write(0x00);
-  Wire.write(0x06);
-  Wire.endTransmission();
- Wire.beginTransmission(0B01001101);//b01001101
- Wire.write(0x01);
-  Wire.write(0xA4);
-  Wire.endTransmission();
-Wire.beginTransmission(0B01001101);//b01001101
-  Wire.write(0x02);
-  Wire.write(0xC3f);
-    Wire.beginTransmission(0B01001101);//b01001101
-    Wire.endTransmission();
-  Wire.write(0x03);
-  Wire.write(0x83f);
-  Wire.endTransmission();
-    Wire.beginTransmission(0B01001101);//b01001101
-  Wire.write(0x04);
-  Wire.write(0x01);
-  Wire.endTransmission();
-    Wire.beginTransmission(0B01001101);//b01001101
-  Wire.write(0x05);
-  Wire.write(0xFF);
-  Wire.endTransmission();
- Wire.beginTransmission(0B01001101);//b01001101
-  Wire.write(0x06);
-Wire.write(0x3D);
-Wire.endTransmission();
-  Wire.beginTransmission(0B01001101);//b01001101
-Wire.write(0x07);
-Wire.write(0x00);
-Wire.endTransmission();
-Wire.beginTransmission(0B01001101);//b01001101
-Wire.write(0x08);
-Wire.write(0x00);
-Wire.endTransmission();
+// LCD Configuration
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // Change the address if needed, and adjust the dimensions
 
- Wire.beginTransmission(0B01001101);//b01001101
-  Wire.write(0x09);
-  switch (chSelect)
-  {
-  case 6:
-    Wire.write(0x01);
-    break;
-  case 7:
-  Wire.write(0x03);
-  break;
-  case 8:
-  Wire.write(0x00);
-  break;
-  }
-  
- // Wire.write(0x0A);
-  //Wire.write(0x01);
- // Wire.write(0x0D);
- // Wire.write(0x11);
+// Rotary Encoder Configuration
+Encoder encoder(2, 3); // Adjust the pin numbers based on your setup
+
+// Switch Input Configuration
+const int switchPin = 4;  // Adjust the pin number based on your setup
+bool switchState = LOW;
+bool lastSwitchState = LOW;
+unsigned long lastSwitchTime = 0;
+unsigned long switchDebounceTime = 50;  // Adjust the debounce time as needed
+
+// Frequency variables for each band with minimum and maximum values
+uint32_t minFrequencyBandI = 54.0e6;
+uint32_t maxFrequencyBandI = 88.0e6;
+uint32_t rfFrequencyBandI =  minFrequencyBandI;  // Starting frequency for Band I (VHF-LO)
+
+uint32_t minFrequencyBandII = 174.0e6;
+uint32_t maxFrequencyBandII = 216.0e6;
+uint32_t rfFrequencyBandII = minFrequencyBandII;  // Starting frequency for Band II (VHF-HI)
+
+uint32_t minFrequencyBandIII = 470.0e6;
+uint32_t maxFrequencyBandIII = 806.0e6;
+uint32_t rfFrequencyBandIII = minFrequencyBandIII;  // Starting frequency for Band III (UHF)
+
+uint32_t minFrequencyBandIV = 807.0e6;
+uint32_t maxFrequencyBandIV = 1.4e9;
+uint32_t rfFrequencyBandIV = minFrequencyBandIV;  // Starting frequency for Band IV
+
+uint8_t dividerByte1, dividerByte2;
+uint8_t slaveAddress = 0x20; // Replace with your actual slave address
+uint8_t controlByte = 0x3C; // Replace with your actual control byte
+uint8_t portControlBandI = 0x01;  // Port control value for Band I
+uint8_t portControlBandII = 0x02;  // Port control value for Band II
+uint8_t portControlBandIII = 0x03;  // Port control value for Band III
+uint8_t portControlBandIV = 0x04;  // Port control value for Band IV
+
+void setDeviceConfiguration(uint8_t slaveAddress, uint8_t dividerByte1, uint8_t dividerByte2, uint8_t controlByte, uint8_t portControl) {
+  Wire.beginTransmission(DEVICE_ADDRESS);
+  Wire.write(dividerByte1);
+  Wire.write(dividerByte2);
+  Wire.write(controlByte);
+  Wire.write(portControl);
   Wire.endTransmission();
 }
 
-void TVtuner(uint16_t data,int source){
-  uint16_t fpd =0;
-  //Wire.beginTransmission(0x61); //TDA6508
-  TCA9548A(tvSelect);
- Wire.beginTransmission(0x61);//UTA6039
- switch (source)
- {
- case 1 :
- fpd = (data + TVIF);
-  Wire.write(fpd >> 8);
-  Wire.write(fpd & 0xff);
-  Wire.write(0xc0);
-  Wire.write(0x01);
-  Wire.write(0x00);
-   break;
- case 2:
-  fpd = (data + FMradioIF);
-  Wire.write(fpd >> 8);
-  Wire.write(fpd & 0xff);
-  Wire.write(0xc0);
-  Wire.write(0x01);
-   Wire.write(0x00);
+void calculateDividerBytes(uint32_t rfFrequency, uint8_t &dividerByte1, uint8_t &dividerByte2) {
+  uint16_t dividerValue = rfFrequency / (REFERENCE_DIVIDER * STEP_SIZE);
+  dividerByte1 = (dividerValue >> 8) & 0xFF;
+  dividerByte2 = dividerValue & 0xFF;
+}
 
-   break;
-case 3:
- fpd = (data + FM915IF);
-  Wire.write(fpd >> 8);
-  Wire.write(fpd & 0xff);
-  Wire.write(0xc0);
-  Wire.write(0x00);
-  // Wire.write(0x00);
-   break;
-   case 4:
- fpd = (data + CBIF);
-  Wire.write(fpd >> 8);
-  Wire.write(fpd & 0xff);
-  Wire.write(0xc0);
-  Wire.write(0x0A);
-   Wire.write(0x00);
-   break;
- }
- 
-  Wire.endTransmission();
+void displayConfigurationOnLCD(uint32_t rfFrequency) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("RF Frequency:");
+
+  lcd.setCursor(0, 1);
+  lcd.print(rfFrequency / 1e6, 1);  // Display frequency in MHz with one decimal place
+  lcd.print(" MHz");
 }
-void videoSwitch(){
-    TCA9548A(4);
-Wire.beginTransmission(0x48);
-Wire.write(0x00);
-Wire.write(0x00);
-Wire.write(0x0c);
-Wire.write(0x00);
-Wire.endTransmission();
-}
-void AudioSelector(int p){
-  switch (p)
-  {
-  case 1:
-    digitalWrite(cnt1,HIGH);
-    digitalWrite(cnt2,LOW);
-    break;
-    case 2:
-    digitalWrite(cnt1,HIGH);
-    digitalWrite(cnt2,HIGH);
-    break;
+
+void switchBand() {
+  // Switch to the next band
+  if (portControlBandI == 0x01) {
+    // Switch from Band I to Band II
+    portControlBandI = 0x00;
+    portControlBandII = 0x01;
+    rfFrequencyBandI = minFrequencyBandII;
+    calculateDividerBytes(rfFrequencyBandII, dividerByte1, dividerByte2);
+    setDeviceConfiguration(slaveAddress, dividerByte1, dividerByte2, controlByte, portControlBandII);
+    displayConfigurationOnLCD(rfFrequencyBandII);
+  } else if (portControlBandII == 0x02) {
+    // Switch from Band II to Band III
+    portControlBandII = 0x00;
+    portControlBandIII = 0x01;
+    rfFrequencyBandII = minFrequencyBandIII;
+    calculateDividerBytes(rfFrequencyBandIII, dividerByte1, dividerByte2);
+    setDeviceConfiguration(slaveAddress, dividerByte1, dividerByte2, controlByte, portControlBandIII);
+    displayConfigurationOnLCD(rfFrequencyBandIII);
+  } else if (portControlBandIII == 0x03) {
+    // Switch from Band III to Band IV
+    portControlBandIII = 0x00;
+    portControlBandIV = 0x01;
+    rfFrequencyBandIII = minFrequencyBandIV;
+    calculateDividerBytes(rfFrequencyBandIV, dividerByte1, dividerByte2);
+    setDeviceConfiguration(slaveAddress, dividerByte1, dividerByte2, controlByte, portControlBandIV);
+    displayConfigurationOnLCD(rfFrequencyBandIV);
+  } else if (portControlBandIV == 0x04) {
+    // Switch from Band IV back to Band I
+    portControlBandIV = 0x00;
+    portControlBandI = 0x01;
+    rfFrequencyBandIV = minFrequencyBandI;
+    calculateDividerBytes(rfFrequencyBandI, dividerByte1, dividerByte2);
+    setDeviceConfiguration(slaveAddress, dividerByte1, dividerByte2, controlByte, portControlBandI);
+    displayConfigurationOnLCD(rfFrequencyBandI);
   }
 }
-void DTVTuner(uint16_t data){
-  TCA9548A(5);
- uint16_t fpd =0;
- fpd = (data   );
-  Wire.beginTransmission(0B01100000);//b01001101
-   Wire.write(0x27);//fpd&0xff//0b10010000
-  Wire.write(0x10);//fpd>>8//0b00101000
-  Wire.write(0x8B);
-  Wire.write(0x38);
-  Wire.write(0xe3);
- Wire.endTransmission();
-}
+
+
+
 void setup() {
-  // put your setup code here, to run once:
-    irrecv.enableIRIn();
-    Wire.begin();
-Serial.begin(9600);
-  lcd.init(); 
-   lcd.begin(16,2);
-  lcd.backlight();
-  pinMode(clk,INPUT);
-  pinMode(dta,INPUT);
-  pinMode(sw,INPUT);
-  pinMode(s0,OUTPUT);
-  pinMode(s1,OUTPUT);
-  pinMode(en,OUTPUT);
- pinMode(cnt1,OUTPUT);
- pinMode(cnt2,OUTPUT);
-  previceClock = digitalRead(clk);
-  videoSwitch();
-videoProcessors();
-lcd.setCursor(0,0);
-lcd.print("DTV Tuner");
-//AudioSelector(2);
+  Wire.begin();
+  lcd.begin(16, 2);  // Adjust these values based on your LCD module
+
+  pinMode(switchPin, INPUT_PULLUP);  // Internal pull-up resistor for the switch
+
+  // Set the initial configuration for Band I (VHF-LO)
+  calculateDividerBytes(rfFrequencyBandI, dividerByte1, dividerByte2);
+  setDeviceConfiguration(slaveAddress, dividerByte1, dividerByte2, controlByte, portControlBandI);
+
+  // Display the initial configuration on the LCD for Band I
+  displayConfigurationOnLCD(rfFrequencyBandI);
 }
-int count=0;
 
 void loop() {
-  // put your main code here, to run repeatedly:
-   cureentclock = digitalRead(clk);
-  
-  if(cureentclock != previceClock){
-   if(cureentclock != digitalRead(dta)){
-    FrequencyVariable--;
-     TVtuner(FrequencyVariable,count);
-      DTVTuner(FrequencyVariable);
-    switch (count)
-    {
-     
-    case 1:
-      Serial.print("TV: ");
-      lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("TV:");
-      break;
-     case 2:
-      Serial.print("FM: ");
-       lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("FM:");
-      break;
-       case 3:
-      Serial.print("FMVH: ");
-       lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("FMVH:");
-      break;
-       case 4:
-      Serial.print("CB: ");
-       lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("CB:");
-      break;
-   
-    }
-    Serial.println(FrequencyVariable);
-     lcd.setCursor(3,0);
-    lcd.print(FrequencyVariable);
-    }
-   else{
-    FrequencyVariable++;
-      TVtuner(FrequencyVariable,count);
-       switch (count)
-    {
-   
-    case 1:
-      Serial.print("TV: ");
-       lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("TV:");
-      break;
-     case 2:
-      Serial.print("FM: ");
-       lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("FM:");
-      break;
-       case 3:
-      Serial.print("FM915: ");
-       lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("FMVH:");
-      break;
-       case 4:
-      Serial.print("CB: ");
-       lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("CB:");
-      break;
-   
-    }
-    lcd.setCursor(3,0);
-    lcd.print(FrequencyVariable);
-      Serial.println(FrequencyVariable);
+  static long lastEncoded = 0;
+  long encoderValue = encoder.read();
+
+  // Read the switch input and debounce
+  int reading = digitalRead(switchPin);
+  if (reading != lastSwitchState) {
+    lastSwitchTime = millis();
+  }
+
+  if ((millis() - lastSwitchTime) > switchDebounceTime) {
+    if (reading != switchState) {
+      switchState = reading;
+
+      // Toggle between bands on switch press
+      if (switchState == HIGH) {
+        switchBand();
+      }
     }
   }
-  previceClock = cureentclock;
-  if(irrecv.decode(&results)){
-   //Serial.println(results.value);
-   switch(results.value){
-     case 3772784863:
-     FrequencyVariable = TVFrequency;
-     count =1;
-     break;
-     case 3772817503:
-     FrequencyVariable = FMFrequency;
-     count =2;
-     break;
-     case 3772801183:
-     FrequencyVariable = FM915Frequency;
-     count =3;
-     break;
-   case 3772780783:
-   FrequencyVariable = CBFraquency;
-   count =4;
-   break;
-   case 3772790473:
-    AudioSelector(1);
-   tvSelect =1;
-   lcd.setCursor(0,1);
-   lcd.print("TV 1");
-   break;
-   case 3772819543:
-    AudioSelector(2);
-   tvSelect =2;
-    lcd.setCursor(0,1);
-   lcd.print("TV 2");
-   break;
-   case 3772797103:
-   chSelect =6;
-   videoProcessors();
-   AudioSelector(1);
-   break; 
-   case 3772788943:
-   chSelect =7;
-   videoProcessors();
-   AudioSelector(2);
-   break;
-   case 3772821583:
-   chSelect =8;
-   videoProcessors();
-   break;
-   case 3772778233:
-   AudioSelector(1);
-   break;
-   case 3772810873:
-   AudioSelector(2);
-   break;
-   }
-   videoSwitchOutput(chSelect);
+
+  if (encoderValue != lastEncoded) {
+    // Adjust the frequency based on the encoder rotation (for simplicity, using a fixed step)
+    if (encoderValue > lastEncoded) {
+      if (rfFrequencyBandI + 0.1e6 <= maxFrequencyBandI) {
+        rfFrequencyBandI += 0.1e6;  // Increase frequency by 0.1 MHz
+      }
+    } else {
+      if (rfFrequencyBandI - 0.1e6 >= minFrequencyBandI) {
+        rfFrequencyBandI -= 0.1e6;  // Decrease frequency by 0.1 MHz
+      }
+    }
+
+    // Calculate new divider bytes and set the device configuration
+    calculateDividerBytes(rfFrequencyBandI, dividerByte1, dividerByte2);
+    setDeviceConfiguration(slaveAddress, dividerByte1, dividerByte2, controlByte, portControlBandI);
+
+    // Update the LCD display
+    displayConfigurationOnLCD(rfFrequencyBandI);
+
+    lastEncoded = encoderValue;
   }
-  irrecv.resume();
+
+  // Your other loop code, if needed
 }
+
+
+
+ 
+
